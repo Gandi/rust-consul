@@ -2,6 +2,10 @@
 name = "rust-consul"
 version = "0.0.1"
 
+license = "BSD-2-Clause"
+authors = ["baloo@gandi.net"]
+description = "A tokio based rust client for consul."
+
 [dependencies]
 futures = "0.1"
 hyper = "0.11"
