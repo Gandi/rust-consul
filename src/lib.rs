@@ -194,7 +194,7 @@ impl Blocking {
         headers.get::<Self>().ok_or(()).map(|res| res.clone())
     }
 
-    fn as_string(&self) -> String {
+    fn to_string(&self) -> String {
         let mut out = String::new();
         let _ = write!(out, "{}", self.index);
         out
@@ -203,7 +203,7 @@ impl Blocking {
     fn add_to_uri(&self, uri: &Url) -> Url {
         let mut uri = uri.clone();
         uri.query_pairs_mut()
-            .append_pair("index", self.as_string().as_str())
+            .append_pair("index", self.to_string().as_str())
 
             .finish();
         uri
