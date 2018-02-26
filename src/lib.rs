@@ -123,6 +123,8 @@ pub enum ProtocolError {
     NonOkResult(StatusCode),
     /// connection refused to consul
     ConnectionRefused,
+    /// we had an error, and consumer resetted the stream
+    StreamRestarted,
 }
 
 impl fmt::Display for ProtocolError {
@@ -132,6 +134,7 @@ impl fmt::Display for ProtocolError {
             ProtocolError::ContentTypeNotJson => write!(f, "{}", self.description()),
             ProtocolError::NonOkResult(ref status) => write!(f, "Non ok result from consul: {}", status),
             ProtocolError::ConnectionRefused => write!(f, "connection refused to consul"),
+            ProtocolError::StreamRestarted => write!(f, "consumer restarted the stream"),
         }
     }
 }
@@ -143,6 +146,7 @@ impl StdError for ProtocolError {
             ProtocolError::ContentTypeNotJson => "Consul replied with a non-json content",
             ProtocolError::NonOkResult(_) => "Non ok result from consul",
             ProtocolError::ConnectionRefused => "connection refused to consul",
+            ProtocolError::StreamRestarted => "consumer restarted the stream",
         }
     }
 }
@@ -724,6 +728,33 @@ impl Stream for WatcherState {
 pub struct Watcher<T>{
     state: WatcherState,
     phantom: PhantomData<T>,
+}
+
+impl<T> Watcher<T> {
+    /// Whenever the stream yield an error. The stream closes and
+    /// can't be consumed anymore. In such cases, you are required to reset
+    /// the stream. It will then, sleep (according to the error strategy)
+    /// and reconnect to consul.
+    pub fn reset(&mut self) {
+        let (base_uri, client, blocking, mut error_state) = match mem::replace(&mut self.state, WatcherState::Working) {
+            WatcherState::Init{base_uri, client, error_strategy, ..} =>
+                (base_uri, client, Blocking::default(), ErrorState::from(error_strategy)),
+            WatcherState::Completed{base_uri, client, blocking, error_state, ..} |
+            WatcherState::Error{base_uri, client, blocking, error_state, ..} |
+            WatcherState::PendingHeaders{base_uri, client, blocking, error_state, ..} |
+            WatcherState::PendingBody{base_uri, client, blocking, error_state, ..} =>
+                (base_uri, client, blocking, error_state),
+            WatcherState::Working => panic!("stream resetted while polled. State is invalid"),
+        };
+        error_state.last_error = Some(ProtocolError::StreamRestarted);
+        self.state = WatcherState::Error{
+             base_uri,
+             client,
+             blocking,
+             error_state,
+             retry: None,
+        };
+    }
 }
 
 impl<T> Stream for Watcher<T>
