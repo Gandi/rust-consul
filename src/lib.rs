@@ -453,7 +453,7 @@ impl Future for DebugTimeout {
 }
 
 fn url_to_uri(uri: &Url) -> Uri {
-    let out = Uri::from_str(uri.as_str())
+    let out = Uri::from_str(uri.as_str());
     if out.is_err() {
         error!("url malformed: {:?}", uri);
     }
