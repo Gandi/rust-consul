@@ -1,6 +1,6 @@
 [package]
 name = "rust-consul"
-version = "0.1.0"
+version = "0.1.1"
 
 license = "BSD-2-Clause"
 authors = ["baloo@gandi.net"]
@@ -8,12 +8,12 @@ description = "A tokio based rust client for consul."
 
 [dependencies]
 futures = "0.1"
-hyper = "0.11"
-hyper-tls = "0.1"
-native-tls = "0.1"
-log = "0.3"
+hyper = "0.12"
+hyper-tls = "0.3"
+native-tls = "0.2"
+log = "0.4"
 tokio-core = "0.1"
-url = "1.5"
+url = "1.7"
 
 serde = "1.0"
 serde_json = "1.0"
