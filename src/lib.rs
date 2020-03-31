@@ -13,7 +13,7 @@ extern crate native_tls;
 extern crate serde;
 #[macro_use] extern crate serde_derive;
 extern crate serde_json;
-extern crate tokio_core;
+extern crate tokio;
 extern crate url;
 
 use std::error::{Error as StdError};
@@ -28,16 +28,19 @@ use std::marker::PhantomData;
 
 use serde_json::{from_slice, Error as JsonError, Value as JsonValue};
 use futures::{Stream, Future, Poll, Async};
+use futures::future::{empty as empty_future, Empty};
 use hyper::{Chunk, Body, StatusCode, Uri};
-use hyper::client::{Client as HttpClient, FutureResponse, HttpConnector};
-use hyper::header::{Header, ContentType, Headers, Raw, Formatter as HyperFormatter};
-use hyper::header::parsing::from_one_raw_str;
-use hyper::error::{Error as HyperError, Result as HyperResult};
+use hyper::client::{Client as HttpClient, ResponseFuture, HttpConnector};
+use hyper::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use hyper::error::{Error as HyperError};
 use hyper_tls::HttpsConnector;
 use native_tls::{Error as TlsError};
-use tokio_core::reactor::{Handle, Timeout};
+use tokio::reactor::Handle;
+use tokio::timer::Timeout;
 use url::{Url, ParseError as UrlParseError};
+use native_tls::TlsConnector;
 
+type Headers = HeaderMap<HeaderValue>;
 
 /// General errors that breaks the stream
 #[derive(Debug)]
@@ -194,8 +197,12 @@ struct Blocking {
 }
 
 impl Blocking {
-    fn from<'a>(headers: &'a Headers) -> Result<Self, ()> {
-        headers.get::<Self>().ok_or(()).map(|res| res.clone())
+    fn from(headers: &HeaderMap<HeaderValue>) -> Result<Self, ()> {
+        let raw_header: Result<&HeaderValue, ()> = headers.get("X-Consul-Index")
+            .ok_or(());
+        raw_header
+            .and_then(|res| res.to_str().map_err(|_| ()))
+            .and_then(|res| Self::from_str(res).map_err(|_| ()))
     }
 
     fn to_string(&self) -> String {
@@ -222,20 +229,20 @@ impl Default for Blocking {
     }
 }
 
-impl Header for Blocking {
-    fn header_name() -> &'static str {
-        static NAME: &'static str = "X-Consul-Index";
-        NAME
-    }
-
-    fn parse_header(raw: &Raw) -> HyperResult<Self> {
-        from_one_raw_str(raw)
-    }
-
-    fn fmt_header(&self, f: &mut HyperFormatter) -> fmt::Result {
-        f.fmt_line(self)
-    }
-}
+//impl Header for Blocking {
+//    fn header_name() -> &'static str {
+//        static NAME: &'static str = "X-Consul-Index";
+//        NAME
+//    }
+//
+//    fn parse_header(raw: &Raw) -> HyperResult<Self> {
+//        from_one_raw_str(raw)
+//    }
+//
+//    fn fmt_header(&self, f: &mut HyperFormatter) -> fmt::Result {
+//        f.fmt_line(self)
+//    }
+//}
 
 impl FromStr for Blocking {
     type Err = ParseIntError;
@@ -304,12 +311,18 @@ impl Client {
     /// Allocate a new consul client
     pub fn new(base_uri: &str, handle: &Handle) -> Result<Client, Error> {
         let base_uri = Url::parse(base_uri)?;
+        let threads = 4;
 
-        let connector = HttpsConnector::new(4, handle)?;
-        let http_client = HttpClient::configure()
+        let mut http = HttpConnector::new(threads);
+        http.enforce_http(false);
+        http.set_reactor(Some(handle.clone()));
+        let tls = TlsConnector::builder().build()?;
+
+        let connector = HttpsConnector::from((http, tls));
+
+        let http_client = HttpClient::builder()
             .keep_alive(true)
-            .connector(connector)
-            .build(handle);
+            .build(connector);
 
         Ok(Client{
             http_client,
@@ -400,7 +413,7 @@ struct ErrorState{
 }
 
 impl ErrorState {
-    pub fn next_timeout(&self, handle: &Handle) -> DebugTimeout {
+    pub fn next_timeout(&self) -> DebugTimeout {
         let retries = if self.current_retries > 10 {
             10
         } else {
@@ -410,10 +423,7 @@ impl ErrorState {
         debug!("Will sleep for {} seconds and retry", retries);
         let duration = Duration::new(retries, 0);
 
-        DebugTimeout(
-            // TODO: meh unwrap()
-            Timeout::new(duration, handle).unwrap()
-        )
+        DebugTimeout::new(duration)
     }
 }
 
@@ -430,7 +440,13 @@ impl From<ErrorStrategy> for ErrorState {
     }
 }
 
-struct DebugTimeout(Timeout);
+struct DebugTimeout(Timeout<Empty<(), io::Error>>);
+
+impl DebugTimeout {
+    pub fn new(duration: Duration) -> Self {
+        DebugTimeout(Timeout::new(empty_future(), duration))
+    }
+}
 
 impl fmt::Debug for DebugTimeout {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
@@ -448,7 +464,13 @@ impl Future for DebugTimeout {
         let res = self.0.poll();
 
         trace!("res {:?}", res);
-        res
+        match res {
+            Err(err) => match err.into_inner() {
+                Some(err) => Err(err),
+                None => Ok(Async::Ready(())),
+            },
+            Ok(ready) => Ok(ready),
+        }
     }
 }
 
@@ -486,7 +508,7 @@ enum WatcherState{
         base_uri: Url,
         client: Client,
         error_state: ErrorState,
-        request: FutureResponse,
+        request: ResponseFuture,
         blocking: Blocking,
     },
     PendingBody {
@@ -504,7 +526,7 @@ impl Stream for WatcherState {
     type Item = Result<Chunk, ProtocolError>;
     type Error = Error;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    fn poll(&mut self) -> Poll<Option<Self::Item>, <WatcherState as Stream>::Error> {
         trace!("polling WatcherState");
         loop {
             match mem::replace(self, WatcherState::Working) {
@@ -541,38 +563,32 @@ impl Stream for WatcherState {
                     trace!("{}: polling headers", base_uri);
 
                     match request.poll() {
-                        Err(HyperError::Io(e)) => {
-                            warn!("{}: got io error: {}", base_uri, e);
-                            match e.kind() {
-                                io::ErrorKind::ConnectionRefused => {
-                                    let err = ProtocolError::ConnectionRefused;
-                                    error_state.last_error = Some(err);
-                                    error_state.current_retries += 1;
-                                    *self = WatcherState::Error{
-                                         base_uri,
-                                         client,
-                                         blocking,
-                                         error_state,
-                                         retry: None,
-                                    };
-                                    return Ok(Async::Ready(Some(Err(err))));
-                                },
-                                _ => {
-                                    return Err(e.into());
-                                }
-                            }
-                        },
                         Err(e) => {
-                            error!("{}: got error, stopping: {}", base_uri, e);
-                            return Err(e.into());
+                            if e.is_connect() {
+                                warn!("{}: got io error: {}", base_uri, e);
+                                let err = ProtocolError::ConnectionRefused;
+                                error_state.last_error = Some(err);
+                                error_state.current_retries += 1;
+                                *self = WatcherState::Error{
+                                     base_uri,
+                                     client,
+                                     blocking,
+                                     error_state,
+                                     retry: None,
+                                };
+                                return Ok(Async::Ready(Some(Err(err))));
+                            } else {
+                                error!("{}: got error, stopping: {}", base_uri, e);
+                                return Err(e.into());
+                            }
                         },
                         Ok(Async::Ready(response_headers)) => {
                             let status = response_headers.status();
                             let headers = response_headers.headers().clone();
-                            let response_has_json_content_type = headers.get::<ContentType>().map(|h| h.eq(&ContentType::json())).unwrap_or(false);
+                            let response_has_json_content_type = headers.get(CONTENT_TYPE).map(|h| h.eq("application/json")).unwrap_or(false);
                             error_state.last_contact = Some(Instant::now());
 
-                            if status != StatusCode::Ok {
+                            if status != StatusCode::OK {
                                 warn!("{}: got non-200 status: {}", base_uri, status);
                                 let err = ProtocolError::NonOkResult(status);
                                 error_state.last_error = Some(err);
@@ -601,7 +617,7 @@ impl Stream for WatcherState {
                             } else {
 
                                 trace!("{}: got headers {} {:?} => PendingBody", base_uri, status, headers);
-                                let body = BodyBuffer::new(response_headers.body());
+                                let body = BodyBuffer::new(response_headers.into_body());
 
                                 *self = WatcherState::PendingBody {
                                     base_uri,
@@ -705,7 +721,7 @@ impl Stream for WatcherState {
                             return Ok(Async::NotReady);
                         }
                     } else {
-                        let next_timeout = error_state.next_timeout(&client.handle);
+                        let next_timeout = error_state.next_timeout();
                         trace!("{}: setting timeout", base_uri);
                         *self = WatcherState::Error{
                             base_uri,
@@ -892,7 +908,7 @@ enum FutureState {
     PendingHeaders {
         base_uri: Url,
         client: Client,
-        request: FutureResponse,
+        request: ResponseFuture,
     },
     PendingBody {
         base_uri: Url,
@@ -930,8 +946,8 @@ impl Future for FutureState {
                         Async::Ready(response_headers) => {
                             let status = response_headers.status();
                             let headers = response_headers.headers().clone();
-                            let response_has_json_content_type = headers.get::<ContentType>().map(|h| h.eq(&ContentType::json())).unwrap_or(false);
-                            if status != StatusCode::Ok {
+                            let response_has_json_content_type = headers.get(CONTENT_TYPE).map(|h| h.eq("application/json")).unwrap_or(false);
+                            if status != StatusCode::OK {
                                 let err = ProtocolError::NonOkResult(status);
                                 return Err(Error::BodyParse(ParseError::Protocol(err)))
                             } else if !response_has_json_content_type {
@@ -939,7 +955,7 @@ impl Future for FutureState {
                                 return Err(Error::BodyParse(ParseError::Protocol(err)))
                             } else {
                                 trace!("got headers {} {:?} => PendingBody", status, headers);
-                                let body = BodyBuffer::new(response_headers.body());
+                                let body = BodyBuffer::new(response_headers.into_body());
                                 *self = FutureState::PendingBody {
                                     base_uri,
                                     client,
