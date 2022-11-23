@@ -17,7 +17,7 @@ extern crate tokio;
 extern crate url;
 
 use std::error::{Error as StdError};
-use std::fmt::{self, Write};
+use std::fmt;
 use std::io;
 use std::mem;
 use std::net::IpAddr;
@@ -133,8 +133,8 @@ pub enum ProtocolError {
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match *self {
-            ProtocolError::BlockingMissing => write!(f, "{}", self.description()),
-            ProtocolError::ContentTypeNotJson => write!(f, "{}", self.description()),
+            ProtocolError::BlockingMissing => write!(f,  "X-Consul-Index missing from response"),
+            ProtocolError::ContentTypeNotJson => write!(f, "Consul replied with a non-json content"),
             ProtocolError::NonOkResult(ref status) => write!(f, "Non ok result from consul: {}", status),
             ProtocolError::ConnectionRefused => write!(f, "connection refused to consul"),
             ProtocolError::StreamRestarted => write!(f, "consumer restarted the stream"),
@@ -169,7 +169,7 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match *self {
             ParseError::Protocol(ref pe) => write!(f, "Protocol error: {}", pe),
-            ParseError::UnexpectedJsonFormat => write!(f, "{}", self.description()),
+            ParseError::UnexpectedJsonFormat => write!(f, "Unexpected json format"),
             ParseError::BodyParsing(ref je) => write!(f, "Data not in json format: {}", je),
         }
     }
@@ -191,7 +191,7 @@ impl From<ProtocolError> for ParseError {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct Blocking {
     index: u64,
 }
@@ -205,12 +205,6 @@ impl Blocking {
             .and_then(|res| Self::from_str(res).map_err(|_| ()))
     }
 
-    fn to_string(&self) -> String {
-        let mut out = String::new();
-        let _ = write!(out, "{}", self.index);
-        out
-    }
-
     fn add_to_uri(&self, uri: &Url) -> Url {
         let mut uri = uri.clone();
         uri.query_pairs_mut()
@@ -221,13 +215,6 @@ impl Blocking {
     }
 }
 
-impl Default for Blocking {
-    fn default() -> Blocking {
-        Blocking {
-            index: 0,
-        }
-    }
-}
 
 //impl Header for Blocking {
 //    fn header_name() -> &'static str {
@@ -285,7 +272,7 @@ impl Future for BodyBuffer {
             match self.inner.poll() {
                 Ok(Async::NotReady) => return Ok(Async::NotReady),
                 Ok(Async::Ready(None)) => {
-                    let buffer = mem::replace(&mut self.buffer, Chunk::default());
+                    let buffer = std::mem::take(&mut self.buffer);
 
                     return Ok(Async::Ready(buffer));
                 },
@@ -304,7 +291,7 @@ impl Future for BodyBuffer {
 pub struct Client {
     http_client: HttpClient<HttpsConnector<HttpConnector>>,
     base_uri: Url,
-    handle: Handle,
+    _handle: Handle,
 }
 
 impl Client {
@@ -327,7 +314,7 @@ impl Client {
         Ok(Client{
             http_client,
             base_uri,
-            handle: handle.clone(),
+            _handle: handle.clone(),
         })
     }
 
@@ -389,22 +376,22 @@ enum ErrorHandling {
 
 #[derive(Debug)]
 struct ErrorStrategy {
-    request_timeout: Duration,
-    on_error: ErrorHandling,
+    _request_timeout: Duration,
+    _on_error: ErrorHandling,
 }
 
 impl Default for ErrorStrategy {
     fn default() -> ErrorStrategy {
         ErrorStrategy {
-            request_timeout: Duration::new(5, 0),
-            on_error: ErrorHandling::RetryBackoff,
+            _request_timeout: Duration::new(5, 0),
+            _on_error: ErrorHandling::RetryBackoff,
         }
     }
 }
 
 #[derive(Debug)]
 struct ErrorState{
-    strategy: ErrorStrategy,
+    _strategy: ErrorStrategy,
     current_retries: u64,
     last_try: Option<Instant>,
     last_contact: Option<Instant>,
@@ -430,7 +417,7 @@ impl ErrorState {
 impl From<ErrorStrategy> for ErrorState {
     fn from(strategy: ErrorStrategy) -> ErrorState {
         ErrorState {
-            strategy,
+            _strategy: strategy,
             current_retries: 0,
             last_try: None,
             last_contact: None,
@@ -835,7 +822,7 @@ impl ConsulType for Services {
     type Reply = Vec<ServiceName>;
 
     fn parse(buf: &Chunk) -> Result<Self::Reply, ParseError> {
-         let v: JsonValue = from_slice(&buf).map_err(ParseError::BodyParsing)?;
+         let v: JsonValue = from_slice(buf).map_err(ParseError::BodyParsing)?;
          let res = read_map_service_name(&v)?;
 
          Ok(res)
@@ -849,7 +836,7 @@ impl ConsulType for ServiceNodes {
     type Reply = Vec<Node>;
 
     fn parse(buf: &Chunk) -> Result<Self::Reply, ParseError> {
-         let v: Vec<TempNode> = from_slice(&buf).map_err(ParseError::BodyParsing)?;
+         let v: Vec<TempNode> = from_slice(buf).map_err(ParseError::BodyParsing)?;
 
          Ok(v.into_iter().map(|x| x.node).collect())
     }
@@ -862,7 +849,7 @@ struct TempNode {
 }
 
 /// Node hosting services
-#[derive(Debug, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone)]
 pub struct Node {
     /// Node name
     #[serde(rename = "Node")]
@@ -893,7 +880,7 @@ impl<T> Future for FutureConsul<T>
             Async::Ready(body) => {
                 T::parse(&body).map(|res| {
                    Async::Ready(res)
-                }).map_err(|e| Error::BodyParse(e))
+                }).map_err(Error::BodyParse)
             },
         }
     }
@@ -1024,7 +1011,7 @@ impl ConsulType for Agent {
     type Reply = Agent;
 
     fn parse(buf: &Chunk) -> Result<Self::Reply, ParseError> {
-        let agent: InnerAgent = serde_json::from_slice(&buf).map_err(ParseError::BodyParsing)?;
+        let agent: InnerAgent = serde_json::from_slice(buf).map_err(ParseError::BodyParsing)?;
         Ok(Agent {
             member_address: agent.member.addr,
         })
